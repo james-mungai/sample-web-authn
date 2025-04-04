@@ -17,6 +17,7 @@
   },
   "homepage": "https://github.com/james-mungai/sample-web-authn#readme",
   "dependencies": {
+    "cbor-x": "^1.6.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "fido2-lib": "^3.5.3"
