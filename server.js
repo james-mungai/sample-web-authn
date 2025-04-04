@@ -119,25 +119,34 @@ app.post('/verify-registration', async (req, res) => {
         const { verified, registrationInfo } = verification;
 
         if (verified && registrationInfo) {
-             console.log(`Registration verified for ${username}. Info:`, registrationInfo);
-            const { credentialPublicKey, credentialID, counter } = registrationInfo;
+             console.log(`Registration verified for ${username}.`); 
+             // Correctly extract nested credential info
+             const { id: credentialIDString, publicKey: credentialPublicKeyBytes, counter } = registrationInfo.credential;
 
-             // Check if this credential ID already exists for *any* user (simple prevention)
-             const exists = Object.values(credentialStore).flat().some(cred => cred.credentialID === credentialID);
+             // Ensure credential store array exists for the user
+             if (!credentialStore[username]) {
+                 credentialStore[username] = [];
+             }
+
+             // Check if this credential ID already exists for *any* user
+             const exists = Object.values(credentialStore).flat().some(cred => cred.credentialID === credentialIDString);
              if(exists) {
+                 console.warn(`Credential ID ${credentialIDString} already registered.`);
                  return res.status(400).send({error: 'Credential already registered.'});
              }
-             console.log(typeof credentialID)
-            // Store the new credential (convert Buffers to base64url for JSON compatibility)
+
+            // Store the new credential using the Base64URL string ID
+            console.log(`DEBUG: Extracted public key bytes (type: ${typeof credentialPublicKeyBytes}):`, credentialPublicKeyBytes);
             const newCredential = {
-                credentialID: isoBase64URL.fromBuffer(credentialID), // Store as base64url string
-                credentialPublicKey: isoBase64URL.fromBuffer(credentialPublicKey), // Store as base64url string
+                credentialID: credentialIDString, // Store the ID string directly
+                credentialPublicKey: isoBase64URL.fromBuffer(credentialPublicKeyBytes), // Store public key as base64url string
                 counter,
-                transports: credential.response.transports, // Store transports if available
+                // Ensure transports is captured, provide default if necessary
+                transports: registrationInfo.credential.transports || credential.response.transports || [],
             };
             credentialStore[username].push(newCredential);
 
-            console.log(`Stored credential for ${username}:`, newCredential.credentialID);
+            console.log(`Stored credential for ${username}: ID = ${newCredential.credentialID}`);
 
             // Clear the challenge
             delete userStore[username].currentChallenge;
@@ -159,14 +168,14 @@ app.post('/verify-registration', async (req, res) => {
 // --- Authentication Routes ---
 
 app.post('/generate-authentication-options', async (req, res) => {
-     const { username } = req.body;
+    const { username } = req.body;
 
     if (!username) {
         return res.status(400).send({ error: 'Username is required' });
     }
 
     const user = userStore[username];
-     const userCredentials = credentialStore[username] || [];
+    const userCredentials = credentialStore[username] || [];
 
     if (!user || userCredentials.length === 0) {
         return res.status(400).send({ error: 'User not found or no credentials registered' });
@@ -176,27 +185,34 @@ app.post('/generate-authentication-options', async (req, res) => {
         const options = await generateAuthenticationOptions({
             rpID,
             // Allow users to select any of their registered credentials
+            // Pass the credential ID STRING directly; the library handles conversion.
             allowCredentials: userCredentials.map(cred => ({
-                id: isoBase64URL.toBuffer(cred.credentialID), // Convert back to Buffer
+                id: cred.credentialID, // Pass the stored Base64URL string ID
                 type: 'public-key',
-                transports: cred.transports,
+                // Ensure transports is an array, provide default if missing or incorrect type
+                transports: Array.isArray(cred.transports) ? cred.transports : undefined,
             })),
             userVerification: 'preferred', // Prefer user verification
         });
 
-         // Temporarily store the challenge
+        // Temporarily store the challenge
         userStore[username].currentChallenge = options.challenge;
-         console.log(`Generated authentication options for ${username}:`, options);
+        console.log(`Generated authentication options for ${username}:`, options);
 
         res.send(options);
     } catch (error) {
-         console.error('Failed to generate authentication options:', error);
-         res.status(500).send({ error: 'Failed to generate authentication options' });
+        console.error('Failed to generate authentication options:', error);
+        res.status(500).send({ error: 'Failed to generate authentication options' });
     }
 });
 
+
 app.post('/verify-authentication', async (req, res) => {
      const { username, credential } = req.body; // credential is the AssertionCredential
+
+     console.log(`\n--- Verify Authentication Attempt ---`);
+     console.log(`Username: ${username}`);
+     console.log(`Received Credential Object (Assertion):`, JSON.stringify(credential, null, 2)); // Log the full assertion
 
      if (!username || !credential) {
          return res.status(400).send({ error: 'Username and credential are required' });
@@ -205,16 +221,44 @@ app.post('/verify-authentication', async (req, res) => {
      const user = userStore[username];
      const userCredentials = credentialStore[username] || [];
 
+     console.log(`Stored Credentials for ${username}:`, JSON.stringify(userCredentials, null, 2));
+
     if (!user || !user.currentChallenge) {
         return res.status(400).send({ error: 'User not found or no authentication challenge pending' });
     }
 
-    // Find the credential being used for login
-     const credentialID_b64url = isoBase64URL.fromBuffer(credential.rawId); // Get ID from assertion
+    // The browser extension seems to send rawId already encoded as Base64URL string in the JSON
+    const credentialID_b64url = credential.rawId;
+    console.log(`Using credentialID from assertion.rawId directly: ${credentialID_b64url}`);
+
      const storedCredential = userCredentials.find(cred => cred.credentialID === credentialID_b64url);
 
     if (!storedCredential) {
+        console.error(`Could not find stored credential matching ID: ${credentialID_b64url}`);
         return res.status(400).send({ error: 'Credential not recognized for this user' });
+    }
+
+    console.log(`Found matching stored credential:`, JSON.stringify(storedCredential, null, 2));
+
+    // Prepare the authenticator object for the library
+    let authenticatorDataForLib;
+    try {
+        const credentialIDBuffer = isoBase64URL.toBuffer(storedCredential.credentialID);
+        const credentialPublicKeyBuffer = isoBase64URL.toBuffer(storedCredential.credentialPublicKey);
+
+        console.log(`DEBUG: Converted credentialID to Buffer (length: ${credentialIDBuffer?.length})`);
+        console.log(`DEBUG: Converted credentialPublicKey to Buffer (length: ${credentialPublicKeyBuffer?.length})`);
+
+        authenticatorDataForLib = {
+            credentialID: credentialIDBuffer,
+            publicKey: credentialPublicKeyBuffer, // Library expects 'publicKey'
+            counter: storedCredential.counter,
+            transports: storedCredential.transports,
+        };
+        console.log(`DEBUG: Prepared authenticator object for library:`, authenticatorDataForLib);
+    } catch (e) {
+        console.error("Error preparing authenticator object for verification:", e);
+        return res.status(500).send({ error: 'Internal server error preparing authenticator data' });
     }
 
     try {
@@ -223,13 +267,8 @@ app.post('/verify-authentication', async (req, res) => {
             expectedChallenge: user.currentChallenge,
             expectedOrigin,
             expectedRPID: rpID,
-            authenticator: { // Provide the stored credential info for verification
-                 credentialID: isoBase64URL.toBuffer(storedCredential.credentialID), // Convert back to buffer
-                 credentialPublicKey: isoBase64URL.toBuffer(storedCredential.credentialPublicKey), // Convert back to buffer
-                 counter: storedCredential.counter,
-                 transports: storedCredential.transports,
-            },
-            requireUserVerification: false, // Set according to your policy
+            authenticator: authenticatorDataForLib, // Pass the dynamically prepared object
+            requireUserVerification: false, // Set based on policy (usually true for login)
         });
 
         const { verified, authenticationInfo } = verification;
